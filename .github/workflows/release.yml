@@ -1,0 +1,128 @@
+name: Build and Release
+
+on:
+- push
+- pull_request
+
+env:
+  GRPC_VERSION: v1.64.0
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ci-releases-${{ github.head_ref || github.ref }}-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+
+  build-linux:
+    runs-on: arc-runner-set
+    steps:
+      - name: Force Install GIT latest
+        run: |
+          sudo apt-get update \
+          && sudo apt-get install -y software-properties-common \
+          && sudo apt-get update \
+          && sudo add-apt-repository -y ppa:git-core/ppa \
+          && sudo apt-get update \
+          && sudo apt-get install -y git
+      - name: Clone
+        uses: actions/checkout@v4
+        with:
+          repository: 'mudler/LocalAI'
+          submodules: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21.x'
+          cache: false
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget curl build-essential ffmpeg protobuf-compiler ccache cmake
+      - name: Intel Dependencies
+        run: |
+          wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          sudo apt update
+          sudo apt install -y intel-basekit
+      - name: Install CUDA Dependencies
+        run: |
+          curl -O https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-nvcc-${CUDA_VERSION} libcublas-dev-${CUDA_VERSION}
+        env:
+          CUDA_VERSION: 12-3
+      - name: "Install Hipblas"
+        env:
+          ROCM_VERSION: "6.1"
+          AMDGPU_VERSION: "6.1"
+        run: |
+            set -ex
+
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl libnuma-dev gnupg
+
+            curl -sL https://repo.radeon.com/rocm/rocm.gpg.key | sudo apt-key add -
+
+            printf "deb [arch=amd64] https://repo.radeon.com/rocm/apt/$ROCM_VERSION/ jammy main" | sudo tee /etc/apt/sources.list.d/rocm.list
+
+            printf "deb [arch=amd64] https://repo.radeon.com/amdgpu/$AMDGPU_VERSION/ubuntu jammy main" | sudo tee /etc/apt/sources.list.d/amdgpu.list
+            printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' | sudo tee /etc/apt/preferences.d/rocm-pin-600
+            sudo apt-get update
+
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                hipblas-dev rocm-dev \
+                rocblas-dev
+
+            sudo apt-get clean
+            sudo rm -rf /var/lib/apt/lists/*
+            sudo ldconfig
+      - name: Cache grpc
+        id: cache-grpc
+        uses: actions/cache@v4
+        with:
+          path: grpc
+          key: ${{ runner.os }}-grpc-${{ env.GRPC_VERSION }}
+      - name: Build grpc
+        if: steps.cache-grpc.outputs.cache-hit != 'true'
+        run: |
+          git clone --recurse-submodules -b ${{ env.GRPC_VERSION }} --depth 1 --shallow-submodules https://github.com/grpc/grpc && \
+          cd grpc && mkdir -p cmake/build && cd cmake/build && cmake -DgRPC_INSTALL=ON \
+            -DgRPC_BUILD_TESTS=OFF \
+            ../.. && sudo make --jobs 5 --output-sync=target
+      - name: Install gRPC
+        run: |
+          cd grpc && cd cmake/build && sudo make --jobs 5 --output-sync=target install
+      # BACKEND_LIBS needed for gpu-workload: /opt/intel/oneapi/*/lib/libiomp5.so /opt/intel/oneapi/*/lib/libmkl_core.so /opt/intel/oneapi/*/lib/libmkl_core.so.2 /opt/intel/oneapi/*/lib/libmkl_intel_ilp64.so /opt/intel/oneapi/*/lib/libmkl_intel_ilp64.so.2 /opt/intel/oneapi/*/lib/libmkl_sycl_blas.so /opt/intel/oneapi/*/lib/libmkl_sycl_blas.so.4 /opt/intel/oneapi/*/lib/libmkl_tbb_thread.so /opt/intel/oneapi/*/lib/libmkl_tbb_thread.so.2 /opt/intel/oneapi/*/lib/libsycl.so /opt/intel/oneapi/*/lib/libsycl.so.7 /opt/intel/oneapi/*/lib/libsycl.so.7.1.0 /opt/rocm-*/lib/libamdhip64.so /opt/rocm-*/lib/libamdhip64.so.5 /opt/rocm-*/lib/libamdhip64.so.6 /opt/rocm-*/lib/libamdhip64.so.6.1.60100 /opt/rocm-*/lib/libhipblas.so /opt/rocm-*/lib/libhipblas.so.2 /opt/rocm-*/lib/libhipblas.so.2.1.60100 /opt/rocm-*/lib/librocblas.so /opt/rocm-*/lib/librocblas.so.4 /opt/rocm-*/lib/librocblas.so.4.1.60100 /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /usr/lib/x86_64-linux-gnu/libOpenCL.so.1 /usr/lib/x86_64-linux-gnu/libOpenCL.so.1.0.0 /usr/lib/x86_64-linux-gnu/libm.so.6 /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 /usr/lib/x86_64-linux-gnu/libc.so.6 /usr/lib/x86_64-linux-gnu/librt.so.1 /usr/local/cuda-*/targets/x86_64-linux/lib/libcublas.so /usr/local/cuda-*/targets/x86_64-linux/lib/libcublasLt.so /usr/local/cuda-*/targets/x86_64-linux/lib/libcudart.so /usr/local/cuda-*/targets/x86_64-linux/lib/stubs/libcuda.so
+      - name: Build
+        id: build
+        run: |
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@8ba23be9613c672d40ae261d2a1335d639bdd59b
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.0
+          export PATH=$PATH:$GOPATH/bin
+          export PATH=/usr/local/cuda/bin:$PATH
+          export PATH=/opt/rocm/bin:$PATH
+          source /opt/intel/oneapi/setvars.sh
+          sudo cp /lib64/ld-linux-x86-64.so.2 ld.so
+          GO_TAGS=p2p tts stablediffusion \
+          BACKEND_LIBS="./ld.so /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /usr/lib/x86_64-linux-gnu/libm.so.6 /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 /usr/lib/x86_64-linux-gnu/libc.so.6 /usr/lib/x86_64-linux-gnu/libgomp.so.1" \
+          make -j4 dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocalAI-linux
+          path: release/
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            release/*
+      - name: Setup tmate session if tests fail
+        if: ${{ failure() }}
+        uses: mxschmitt/action-tmate@v3.18
+        with:
+          detached: true
+          connect-timeout-seconds: 180
+          limit-access-to-actor: true
